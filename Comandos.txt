@@ -1,0 +1,306 @@
+// ============================================================================
+// 1. Bajar los archivos.
+// ============================================================================
+https://datos.madrid.es/egob/catalogo/206974-0-agenda-eventos-culturales-100.json
+https://datos.comunidad.madrid/dataset/ef437c50-5b26-4843-92c3-d8eef5507fac/resource/20237d3a-718f-4179-9631-fc2f4a9fe566/download/alojamientos_turisticos.json
+https://datos.madrid.es/egob/catalogo/201132-0-museos.json
+
+// Se hacen modificaciones manualmente a los archivos originales para poderlos subir. Se busca claves ocultas: ['data', '@graph', 'graph', 'result'] y se extrae.
+//  Los archivos quedan así:
+actividades2.json	944 documentos
+alojamientos.json	1 documento que despues se amnplia
+museos.json	1 documento que despues se amplia
+https://raw.githubusercontent.com/marzo27/publico/main/actividades2.json
+https://raw.githubusercontent.com/marzo27/publico/main/alojamientos.json
+https://raw.githubusercontent.com/marzo27/publico/main/museos.json
+
+
+
+// ============================================================================
+// 2. Subir archivos
+// ============================================================================
+cd C:\app\MongoDB\bin
+mongoimport --verbose --db Proyecto --collection actividades --file "D:\MaestriaUNIR\1. Bases de datos para el Big Data\Actividad2\data\raw\actividades2.json" --jsonArray --drop
+mongoimport --verbose --db Proyecto --collection alojamientos --file "D:\MaestriaUNIR\1. Bases de datos para el Big Data\Actividad2\data\raw\alojamientos.json" --drop
+mongoimport --verbose --db Proyecto --collection museos --file "D:\MaestriaUNIR\1. Bases de datos para el Big Data\Actividad2\data\raw\museos.json" --drop
+
+// ============================================================================
+// 3. Limpieza en Compass Mongo DB Shell
+// ============================================================================
+use Proyecto
+
+
+// 3.1 Transforma la colección alojamientos y crea alojamientos_limpio.
+
+db.alojamientos.aggregate([
+  // 1. DESENROLLAR: Sacamos los hoteles de la lista
+  { $unwind: "$data" },
+
+  // 2. PROYECCIÓN
+  {
+    $project: {
+      _id: 0, // Elimina el ID duplicado.
+      
+      name: { $ifNull: ["$data.denominacion", "$data.nombre", "Sin Nombre"] },
+      type: "Hotel", 
+      category: "$data.categoria",
+      address: {
+        street: "$data.via_nombre",
+        number: "$data.numero",
+        zip_code: "$data.cdpostal",
+        locality: "$data.localidad"
+      },
+      location: null 
+    }
+  },
+
+  // 3. SALIDA
+  { $out: "alojamientos_limpio" }
+])
+
+//10768
+db.alojamientos_limpio.countDocuments()
+
+
+// 3.2 Transforma la colección museos y crea museos_limpio.
+
+db.museos.aggregate([
+  // 1. DESEMPAQUETAR: Sacamos los museos de la lista '@graph'
+  { $unwind: "$@graph" },
+
+  // 2. PROYECCIÓN
+  {
+    $project: {
+      _id: 0, // Generar nuevos IDs para evitar error de duplicados
+      
+      // Accedemos a las propiedades con el prefijo "$@graph."
+      name: { $ifNull: ["$@graph.title", "$@graph.nombre", "Museo Desconocido"] },
+      category: "Museo",
+      contact: "$@graph.relation",
+      
+      location: {
+        type: "Point",
+        coordinates: [
+          // Longitud
+          { $convert: { input: "$@graph.location.longitude", to: "double", onError: null, onNull: null } },
+          // Latitud
+          { $convert: { input: "$@graph.location.latitude", to: "double", onError: null, onNull: null } }
+        ]
+      }
+    }
+  },
+
+  // 3. FILTRO DE CALIDAD: Solo guardamos los que tienen coordenadas válidas
+  { 
+    $match: { 
+      "location.coordinates.0": { $type: "number" } 
+    } 
+  },
+
+  // 4. SALIDA
+  { $out: "museos_limpio" }
+])
+
+
+//69
+db.museos_limpio.countDocuments()
+
+
+// 3.3 Transforma la colección actividades y crea actividades_limpio.
+
+db.actividades.aggregate([
+  {
+    $project: {
+      title: "$title",
+      category: "Evento",
+      date_info: { 
+          start: "$dtstart", 
+          end: "$dtend" 
+      },
+      location: {
+        type: "Point",
+        coordinates: [
+          { $convert: { input: "$location.longitude", to: "double", onError: null, onNull: null } },
+          { $convert: { input: "$location.latitude", to: "double", onError: null, onNull: null } }
+        ]
+      }
+    }
+  },
+  { 
+    $match: { 
+      "location.coordinates.0": { $type: "number" } 
+    } 
+  },
+  { $out: "actividades_limpio" }
+])
+
+
+//859
+db.actividades_limpio.countDocuments()
+
+// ============================================================================
+// 4 Creación de Índices
+// ============================================================================
+
+// Índice geoespacial para Museos
+db.museos_limpio.createIndex({ location: "2dsphere" })
+
+// Índice geoespacial para Actividades
+db.actividades_limpio.createIndex({ location: "2dsphere" })
+
+// ============================================================================
+// 5 Consultas
+// ============================================================================
+
+
+// ============================================================================
+// 5.1 Consulta: Contar cuántos eventos culturales hay esta semana a menos de 1km de los principales museos, para crear paquetes turísticos conjuntos.
+// ============================================================================
+
+
+
+// 1. CONFIGURACIÓN DEL ENTORNO
+// --------------------------------------------------------
+// CORRECCIÓN: Usamos la función JS estándar en lugar de 'use'
+db = db.getSiblingDB('Proyecto');
+
+// Definimos el radio de búsqueda (1 km) en radianes
+const RADIO_KM = 1.0;
+const RADIO_RADIANES = RADIO_KM / 6378.1;
+
+// 2. SIMULACIÓN DE FECHA ("ESTA SEMANA")
+// --------------------------------------------------------
+const FECHA_INICIO = "2026-01-28"; 
+const FECHA_FIN    = "2026-02-05"; 
+
+print("==========================================================");
+print("🕵️  BUSCADOR DE PAQUETES TURÍSTICOS (MUSEO + EVENTO)");
+print("📅  Fecha simulada: " + FECHA_INICIO + " al " + FECHA_FIN);
+print("📍  Radio de búsqueda: " + RADIO_KM + " km");
+print("==========================================================\n");
+
+// 3. ITERACIÓN (JOIN DE APLICACIÓN)
+// --------------------------------------------------------
+var cursorMuseos = db.museos_limpio.find();
+var paquetesEncontrados = 0;
+
+cursorMuseos.forEach(function(museo) {
+    
+    // Verificamos que el museo tenga coordenadas válidas
+    if (museo.location && museo.location.coordinates) {
+        
+        // CONSULTA
+        var totalEventos = db.actividades_limpio.countDocuments({
+            "location": {
+                "$geoWithin": {
+                    "$centerSphere": [ museo.location.coordinates, RADIO_RADIANES ]
+                }
+            },
+            "date_info.start": { 
+                "$gte": FECHA_INICIO,
+                "$lte": FECHA_FIN 
+            }
+        });
+
+        // 4. IMPRESIÓN DE RESULTADOS
+        if (totalEventos > 0) {
+            paquetesEncontrados++;
+            print("🏛️  MUSEO: " + museo.name);
+            print("    🔥 Oportunidades de Cross-Selling: " + totalEventos + " eventos cercanos.");
+            
+            var ejemplo = db.actividades_limpio.findOne({
+                "location": { "$geoWithin": { "$centerSphere": [ museo.location.coordinates, RADIO_RADIANES ] } },
+                "date_info.start": { "$gte": FECHA_INICIO, "$lte": FECHA_FIN }
+            });
+            if(ejemplo) print("    💡 Ejemplo: " + ejemplo.title);
+            print("----------------------------------------------------------");
+        }
+    }
+});
+
+print("\n✅ TOTAL PAQUETES POTENCIALES: " + paquetesEncontrados);
+
+
+
+// ============================================================================
+// 5.2 Consulta: Identificación de 'Puntos Calientes' Culturales (Hotspots): Como analista de turismo, quiero saber cuáles son los museos de Madrid que tienen una mayor oferta de eventos y actividades a su alrededor (en un radio de 1 km) para crear 'Packs Turísticos Combinados' (Visita al Museo + Actividad cercana).
+// ============================================================================
+
+// 1. CONFIGURACIÓN
+// --------------------------------------------------------
+db = db.getSiblingDB('Proyecto');
+
+// Parámetros de Análisis
+const RADIO_KM = 1.0;
+const RADIO_RADIANES = RADIO_KM / 6378.1;
+// Ampliamos el análisis a 1 mes para detectar tendencias reales, no solo eventos puntuales
+const FECHA_INICIO = "2026-01-28"; 
+const FECHA_FIN    = "2026-02-28"; 
+
+print("==========================================================");
+print("🔥  ANÁLISIS DE HOTSPOTS CULTURALES (TOP 10)");
+print("📊  Objetivo: Identificar museos con mayor oferta complementaria");
+print("📅  Ventana de análisis: " + FECHA_INICIO + " al " + FECHA_FIN);
+print("==========================================================\n");
+
+// 2. RECOLECCIÓN DE DATOS
+// --------------------------------------------------------
+var ranking = [];
+var cursorMuseos = db.museos_limpio.find();
+
+print("⏳ Procesando museos (esto puede tardar unos segundos)...");
+
+cursorMuseos.forEach(function(museo) {
+    if (museo.location && museo.location.coordinates) {
+        
+        // Contamos eventos cercanos en el rango de fechas
+        var conteo = db.actividades_limpio.countDocuments({
+            "location": {
+                "$geoWithin": {
+                    "$centerSphere": [ museo.location.coordinates, RADIO_RADIANES ]
+                }
+            },
+            "date_info.start": { "$gte": FECHA_INICIO, "$lte": FECHA_FIN }
+        });
+
+        // Solo nos interesan museos con al menos 1 actividad cercana
+        if (conteo > 0) {
+            ranking.push({
+                nombre: museo.name,
+                eventos: conteo,
+                coordenadas: museo.location.coordinates // Útil si quisieras pintarlo en un mapa luego
+            });
+        }
+    }
+});
+
+// 3. ORDENAMIENTO (EL CEREBRO DEL ANALISTA)
+// --------------------------------------------------------
+// Ordenamos el array de mayor a menor número de eventos
+ranking.sort(function(a, b) {
+    return b.eventos - a.eventos;
+});
+
+// 4. VISUALIZACIÓN DEL TOP 10
+// --------------------------------------------------------
+print("\n🏆  TOP 10 MUSEOS 'HOTSPOTS' EN MADRID");
+print("    (Museos ideales para Packs Combinados)");
+print("----------------------------------------------------------");
+
+// Mostramos solo los 10 primeros
+var top = Math.min(ranking.length, 10);
+
+for (var i = 0; i < top; i++) {
+    var spot = ranking[i];
+    var medalla = (i === 0) ? "🥇" : (i === 1) ? "🥈" : (i === 2) ? "🥉" : "  ";
+    
+    print(medalla + " #" + (i + 1) + " " + spot.nombre);
+    print("      🎯 Oferta cercana: " + spot.eventos + " actividades.");
+    print("----------------------------------------------------------");
+}
+
+print("\n✅ Análisis completado. Se analizaron " + cursorMuseos.count() + " museos.");
+
+
+
+
